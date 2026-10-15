@@ -1,4 +1,4 @@
-name: Build macOS Client (Intel + Apple Silicon)
+name: Build macOS Client (Intel + Apple Silicon, fix Tk 8.6)
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  build-mac:
-    name: Build for ${{ matrix.name }}
+  build-macos:
+    name: Build ${{ matrix.name }} (Tk 8.6)
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -18,74 +18,140 @@ jobs:
         include:
           - name: Intel
             runner: macos-15-intel
-            expected_arch: x86_64
+            arch: x86_64
           - name: AppleSilicon
             runner: macos-15
-            expected_arch: arm64
+            arch: arm64
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v7
+      - name: Download project source
+        uses: actions/checkout@v4
 
-      - name: Select macOS client source
+      - name: Select macOS source file
         shell: bash
         run: |
-          if [[ -f "client-app-macos/exam_client_gui.py" ]]; then
-            echo "APP_FILE=client-app-macos/exam_client_gui.py" >> "$GITHUB_ENV"
-            echo "REQ_FILE=client-app-macos/requirements.txt" >> "$GITHUB_ENV"
-          elif [[ -f "exam_client_gui.py" ]]; then
+          if [[ -f client-app-macos/exam_client_gui.py ]]; then
+            echo 'APP_FILE=client-app-macos/exam_client_gui.py' >> "$GITHUB_ENV"
+            echo 'REQ_FILE=client-app-macos/requirements.txt' >> "$GITHUB_ENV"
+          elif [[ -f exam_client_gui.py ]]; then
             if grep -q 'ctypes.windll' exam_client_gui.py; then
-              echo "::error::Root exam_client_gui.py is the Windows version. Use client-app-macos/exam_client_gui.py for macOS."
+              echo '::error::Found Windows client in project root; macOS client-app-macos/exam_client_gui.py is required.'
               exit 1
             fi
-            echo "APP_FILE=exam_client_gui.py" >> "$GITHUB_ENV"
-            echo "REQ_FILE=requirements.txt" >> "$GITHUB_ENV"
+            echo 'APP_FILE=exam_client_gui.py' >> "$GITHUB_ENV"
+            echo 'REQ_FILE=requirements.txt' >> "$GITHUB_ENV"
           else
-            echo "::error::Cannot find the macOS exam_client_gui.py file."
+            echo '::error::macOS exam_client_gui.py not found.'
             exit 1
           fi
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v7
-        with:
-          python-version: '3.10'
-
-      - name: Check runner CPU architecture
+      # Do not use setup-python's hostedtoolcache build here: it may have
+      # Tcl/Tk dependencies different from those available on students' Macs.
+      - name: Install official python.org Python with bundled Tcl/Tk 8.6
         shell: bash
         run: |
-          echo "Runner CPU: $(uname -m)"
-          python -c 'import platform; print("Python CPU:", platform.machine())'
-          test "$(uname -m)" = "${{ matrix.expected_arch }}"
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/python-3.12.10-macos11.pkg" \
+            'https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg'
+          sudo installer -pkg "$RUNNER_TEMP/python-3.12.10-macos11.pkg" -target /
+          BASE_PY='/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12'
+          "$BASE_PY" -m venv "$RUNNER_TEMP/exam-client-venv"
+          echo "PYTHON=$RUNNER_TEMP/exam-client-venv/bin/python" >> "$GITHUB_ENV"
 
-      - name: Install application dependencies
+      - name: Check CPU and Tcl/Tk versions before build
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r "$REQ_FILE"
-          python -m pip install pyinstaller
+          set -euo pipefail
+          echo "Runner architecture: $(uname -m)"
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          "$PYTHON" - <<'PY'
+          import _tkinter
+          import platform
+          import subprocess
+          import tkinter as tk
+          assert _tkinter.TCL_VERSION.startswith('8.6'), _tkinter.TCL_VERSION
+          assert _tkinter.TK_VERSION.startswith('8.6'), _tkinter.TK_VERSION
+          print('Python:', platform.python_version())
+          print('Compiled Tcl/Tk:', _tkinter.TCL_VERSION, _tkinter.TK_VERSION)
+          print('Tkinter extension:', _tkinter.__file__)
+          print(subprocess.check_output(['otool', '-L', _tkinter.__file__], text=True))
+          # Actually loading Tk catches mismatched 8.5/8.6 libraries.
+          root = tk.Tk()
+          root.withdraw()
+          runtime_tk = root.tk.call('package', 'require', 'Tk')
+          print('Runtime Tk:', runtime_tk)
+          assert str(runtime_tk).startswith('8.6'), runtime_tk
+          root.destroy()
+          PY
 
-      - name: Build macOS .app with PyInstaller
+      - name: Install client dependencies and PyInstaller
         shell: bash
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed \
-            --name IUH_Exam_Client "$APP_FILE"
+          set -euo pipefail
+          "$PYTHON" -m pip install --upgrade pip
+          if [[ -f "$REQ_FILE" ]]; then
+            "$PYTHON" -m pip install -r "$REQ_FILE"
+          else
+            "$PYTHON" -m pip install \
+              customtkinter==5.2.2 requests==2.31.0 mss==9.0.1 Pillow==10.2.0
+          fi
+          "$PYTHON" -m pip install 'pyinstaller==6.22.3'
 
-      - name: Verify bundled app architecture
+      # Smoke-test a *frozen* Tk application as well as the build Python.
+      - name: Test bundled Tkinter (8.6)
         shell: bash
         run: |
-          file dist/IUH_Exam_Client.app/Contents/MacOS/IUH_Exam_Client
-          lipo -archs dist/IUH_Exam_Client.app/Contents/MacOS/IUH_Exam_Client
-          lipo -archs dist/IUH_Exam_Client.app/Contents/MacOS/IUH_Exam_Client | grep -qw "${{ matrix.expected_arch }}"
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/tk_smoke.py" <<'PY'
+          import tkinter as tk
+          root = tk.Tk()
+          root.withdraw()
+          assert str(root.tk.call('package', 'require', 'Tk')).startswith('8.6')
+          root.destroy()
+          PY
+          "$PYTHON" -m PyInstaller --noconfirm --clean --windowed \
+            --target-arch '${{ matrix.arch }}' \
+            --name Tk_Smoke "$RUNNER_TEMP/tk_smoke.py"
+          ./dist/Tk_Smoke.app/Contents/MacOS/Tk_Smoke
+          rm -rf dist/Tk_Smoke.app build/Tk_Smoke Tk_Smoke.spec
 
-      - name: Zip the macOS app (preserve app bundle)
+      - name: Build IUH Exam Client macOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m PyInstaller --noconfirm --clean --windowed \
+            --target-arch '${{ matrix.arch }}' \
+            --collect-all customtkinter \
+            --name IUH_Exam_Client \
+            "$APP_FILE"
+
+      - name: Verify app architecture and bundled Tcl/Tk libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP='dist/IUH_Exam_Client.app'
+          BIN="$APP/Contents/MacOS/IUH_Exam_Client"
+          file "$BIN"
+          lipo -archs "$BIN" | grep -qw '${{ matrix.arch }}'
+          echo 'Tcl/Tk dylibs inside packaged app:'
+          find "$APP/Contents" -name 'libtk8.6*.dylib' -o -name 'libtcl8.6*.dylib'
+          find "$APP/Contents" -name 'libtk8.6*.dylib' | grep -q . || {
+            echo '::error::Tk 8.6 dylib missing from app bundle.'; exit 1;
+          }
+          find "$APP/Contents" -name 'libtcl8.6*.dylib' | grep -q . || {
+            echo '::error::Tcl 8.6 dylib missing from app bundle.'; exit 1;
+          }
+
+      - name: Zip app safely preserving symlinks and permissions
         shell: bash
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             dist/IUH_Exam_Client.app \
-            "dist/IUH_Exam_Client_${{ matrix.name }}.zip"
+            'dist/IUH_Exam_Client_${{ matrix.name }}.zip'
 
-      - name: Upload built app
-        uses: actions/upload-artifact@v7
+      - name: Upload macOS build
+        uses: actions/upload-artifact@v4
         with:
           name: IUH_Exam_Client_${{ matrix.name }}
           path: dist/IUH_Exam_Client_${{ matrix.name }}.zip
